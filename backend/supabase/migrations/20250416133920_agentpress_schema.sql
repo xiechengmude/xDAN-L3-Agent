@@ -6,6 +6,7 @@ CREATE TABLE projects (
     description TEXT,
     account_id UUID NOT NULL REFERENCES basejump.accounts(id) ON DELETE CASCADE,
     sandbox JSONB DEFAULT '{}'::jsonb,
+    is_public BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
 );
@@ -15,6 +16,7 @@ CREATE TABLE threads (
     thread_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     account_id UUID REFERENCES basejump.accounts(id) ON DELETE CASCADE,
     project_id UUID REFERENCES projects(project_id) ON DELETE CASCADE,
+    is_public BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
 );
@@ -95,7 +97,10 @@ ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 -- Project policies
 CREATE POLICY project_select_policy ON projects
     FOR SELECT
-    USING (basejump.has_role_on_account(account_id) = true);
+    USING (
+        is_public = TRUE OR
+        basejump.has_role_on_account(account_id) = true
+    );
 
 CREATE POLICY project_insert_policy ON projects
     FOR INSERT
@@ -117,7 +122,10 @@ CREATE POLICY thread_select_policy ON threads
         EXISTS (
             SELECT 1 FROM projects
             WHERE projects.project_id = threads.project_id
-            AND basejump.has_role_on_account(projects.account_id) = true
+            AND (
+                projects.is_public = TRUE OR
+                basejump.has_role_on_account(projects.account_id) = true
+            )
         )
     );
 
@@ -163,6 +171,7 @@ CREATE POLICY agent_run_select_policy ON agent_runs
             LEFT JOIN projects ON threads.project_id = projects.project_id
             WHERE threads.thread_id = agent_runs.thread_id
             AND (
+                projects.is_public = TRUE OR
                 basejump.has_role_on_account(threads.account_id) = true OR 
                 basejump.has_role_on_account(projects.account_id) = true
             )
@@ -220,6 +229,7 @@ CREATE POLICY message_select_policy ON messages
             LEFT JOIN projects ON threads.project_id = projects.project_id
             WHERE threads.thread_id = messages.thread_id
             AND (
+                projects.is_public = TRUE OR
                 basejump.has_role_on_account(threads.account_id) = true OR 
                 basejump.has_role_on_account(projects.account_id) = true
             )
@@ -270,8 +280,9 @@ CREATE POLICY message_delete_policy ON messages
 
 -- Grant permissions to roles
 GRANT ALL PRIVILEGES ON TABLE projects TO authenticated, service_role;
-GRANT ALL PRIVILEGES ON TABLE threads TO authenticated, service_role;
-GRANT ALL PRIVILEGES ON TABLE messages TO authenticated, service_role;
+GRANT SELECT ON TABLE projects TO anon;
+GRANT SELECT ON TABLE threads TO authenticated, anon, service_role;
+GRANT SELECT ON TABLE messages TO authenticated, anon, service_role;
 GRANT ALL PRIVILEGES ON TABLE agent_runs TO authenticated, service_role;
 
 -- Create a function that matches the Python get_messages behavior
@@ -286,12 +297,19 @@ DECLARE
     current_role TEXT;
     latest_summary_id UUID;
     latest_summary_time TIMESTAMP WITH TIME ZONE;
+    is_project_public BOOLEAN;
 BEGIN
     -- Get current role
     SELECT current_user INTO current_role;
     
-    -- Skip access check for service_role
-    IF current_role = 'authenticated' THEN
+    -- Check if associated project is public
+    SELECT p.is_public INTO is_project_public
+    FROM threads t
+    LEFT JOIN projects p ON t.project_id = p.project_id
+    WHERE t.thread_id = p_thread_id;
+    
+    -- Skip access check for service_role or public projects
+    IF current_role = 'authenticated' AND NOT is_project_public THEN
         -- Check if thread exists and user has access
         SELECT EXISTS (
             SELECT 1 FROM threads t
@@ -361,4 +379,4 @@ END;
 $$;
 
 -- Grant execute permissions
-GRANT EXECUTE ON FUNCTION get_llm_formatted_messages TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION get_llm_formatted_messages TO authenticated, anon, service_role;

@@ -1,7 +1,7 @@
 "use client"
 
 import { Button } from "@/components/ui/button"
-import { Copy, File, PanelRightOpen, Check, X } from "lucide-react"
+import { FolderOpen, Link, PanelRightOpen, Check, X, Menu } from "lucide-react"
 import { usePathname } from "next/navigation"
 import { toast } from "sonner"
 import {
@@ -13,6 +13,10 @@ import {
 import { useState, useRef, KeyboardEvent } from "react"
 import { Input } from "@/components/ui/input"
 import { updateProject } from "@/lib/api"
+import { Skeleton } from "@/components/ui/skeleton"
+import { useIsMobile } from "@/hooks/use-mobile"
+import { cn } from "@/lib/utils"
+import { useSidebar } from "@/components/ui/sidebar"
 
 interface ThreadSiteHeaderProps {
   threadId: string
@@ -21,6 +25,7 @@ interface ThreadSiteHeaderProps {
   onViewFiles: () => void
   onToggleSidePanel: () => void
   onProjectRenamed?: (newName: string) => void
+  isMobileView?: boolean
 }
 
 export function SiteHeader({ 
@@ -29,12 +34,15 @@ export function SiteHeader({
   projectName, 
   onViewFiles, 
   onToggleSidePanel,
-  onProjectRenamed
+  onProjectRenamed,
+  isMobileView
 }: ThreadSiteHeaderProps) {
   const pathname = usePathname()
   const [isEditing, setIsEditing] = useState(false)
   const [editName, setEditName] = useState(projectName)
   const inputRef = useRef<HTMLInputElement>(null)
+  const isMobile = useIsMobile() || isMobileView
+  const { setOpenMobile } = useSidebar()
   
   const copyCurrentUrl = () => {
     const url = window.location.origin + pathname
@@ -65,6 +73,13 @@ export function SiteHeader({
     
     if (editName !== projectName) {
       try {
+        if (!projectId) {
+          toast.error("Cannot rename: Project ID is missing")
+          setEditName(projectName)
+          setIsEditing(false)
+          return
+        }
+        
         const updatedProject = await updateProject(projectId, { name: editName })
         if (updatedProject) {
           onProjectRenamed?.(editName)
@@ -92,7 +107,22 @@ export function SiteHeader({
   }
 
   return (
-    <header className="bg-background sticky top-0 flex h-14 shrink-0 items-center gap-2 z-20 border-b w-full">
+    <header className={cn(
+      "bg-background sticky top-0 flex h-14 shrink-0 items-center gap-2 z-20 w-full",
+      isMobile && "px-2"
+    )}>
+      {isMobile && (
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => setOpenMobile(true)}
+          className="h-9 w-9 mr-1"
+          aria-label="Open sidebar"
+        >
+          <Menu className="h-4 w-4" />
+        </Button>
+      )}
+
       <div className="flex flex-1 items-center gap-2 px-3">
         {isEditing ? (
           <div className="flex items-center gap-1">
@@ -102,7 +132,7 @@ export function SiteHeader({
               onChange={(e) => setEditName(e.target.value)}
               onKeyDown={handleKeyDown}
               onBlur={saveNewName}
-              className="h-7 w-auto min-w-[180px] text-sm font-medium"
+              className="h-8 w-auto min-w-[180px] text-base font-medium"
               maxLength={50}
             />
             <Button
@@ -122,9 +152,11 @@ export function SiteHeader({
               <X className="h-3.5 w-3.5" />
             </Button>
           </div>
+        ) : !projectName || projectName === 'Project' ? (
+          <Skeleton className="h-5 w-32" />
         ) : (
           <div 
-            className="text-sm font-medium text-muted-foreground hover:text-foreground cursor-pointer flex items-center"
+            className="text-base font-medium text-muted-foreground hover:text-foreground cursor-pointer flex items-center"
             onClick={startEditing}
             title="Click to rename project"
           >
@@ -134,55 +166,69 @@ export function SiteHeader({
       </div>
       
       <div className="flex items-center gap-1 pr-4">
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onViewFiles}
-                className="h-9 w-9"
-              >
-                <File className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>
-              <p>View Files in Task</p>
-            </TooltipContent>
-          </Tooltip>
+        {isMobile ? (
+          // Mobile view - only show the side panel toggle
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onToggleSidePanel}
+            className="h-9 w-9 cursor-pointer"
+            aria-label="Toggle computer panel"
+          >
+            <PanelRightOpen className="h-4 w-4" />
+          </Button>
+        ) : (
+          // Desktop view - show all buttons with tooltips
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={onViewFiles}
+                  className="h-9 w-9 cursor-pointer"
+                >
+                  <FolderOpen className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>View Files in Task</p>
+              </TooltipContent>
+            </Tooltip>
 
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={copyCurrentUrl}
-                className="h-9 w-9"
-              >
-                <Copy className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>
-              <p>Copy URL</p>
-            </TooltipContent>
-          </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={copyCurrentUrl}
+                  className="h-9 w-9 cursor-pointer"
+                >
+                  <Link className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>Copy Link</p>
+              </TooltipContent>
+            </Tooltip>
 
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onToggleSidePanel}
-                className="h-9 w-9"
-              >
-                <PanelRightOpen className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>
-              <p>Toggle Tool Details</p>
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={onToggleSidePanel}
+                  className="h-9 w-9 cursor-pointer"
+                >
+                  <PanelRightOpen className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>Toggle Computer Preview (CMD+I)</p>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
       </div>
     </header>
   )

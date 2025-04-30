@@ -1,98 +1,55 @@
 import { createClient } from '@/lib/supabase/client';
 
+// Get backend URL from environment variables
 const API_URL = process.env.NEXT_PUBLIC_BACKEND_URL || '';
 
-// Simple cache implementation
-const apiCache = {
-  projects: new Map(),
-  threads: new Map(),
-  threadMessages: new Map(),
-  agentRuns: new Map(),
-  
-  getProject: (projectId: string) => apiCache.projects.get(projectId),
-  setProject: (projectId: string, data: any) => apiCache.projects.set(projectId, data),
-  
-  getProjects: () => apiCache.projects.get('all'),
-  setProjects: (data: any) => apiCache.projects.set('all', data),
-  
-  getThreads: (projectId: string) => apiCache.threads.get(projectId || 'all'),
-  setThreads: (projectId: string, data: any) => apiCache.threads.set(projectId || 'all', data),
-  
-  getThreadMessages: (threadId: string) => apiCache.threadMessages.get(threadId),
-  setThreadMessages: (threadId: string, data: any) => apiCache.threadMessages.set(threadId, data),
-  
-  getAgentRuns: (threadId: string) => apiCache.agentRuns.get(threadId),
-  setAgentRuns: (threadId: string, data: any) => apiCache.agentRuns.set(threadId, data),
-  
-  // Helper to clear parts of the cache when data changes
-  invalidateThreadMessages: (threadId: string) => apiCache.threadMessages.delete(threadId),
-  invalidateAgentRuns: (threadId: string) => apiCache.agentRuns.delete(threadId),
-};
+// Set to keep track of agent runs that are known to be non-running
+const nonRunningAgentRuns = new Set<string>();
+// Map to keep track of active EventSource streams
+const activeStreams = new Map<string, EventSource>();
 
-// Add a fetch queue system to prevent multiple simultaneous requests
-const fetchQueue = {
-  agentRuns: new Map<string, Promise<any>>(),
-  threads: new Map<string, Promise<any>>(),
-  messages: new Map<string, Promise<any>>(),
-  projects: new Map<string, Promise<any>>(),
-  
-  getQueuedAgentRuns: (threadId: string) => fetchQueue.agentRuns.get(threadId),
-  setQueuedAgentRuns: (threadId: string, promise: Promise<any>) => {
-    fetchQueue.agentRuns.set(threadId, promise);
-    // Auto-clean the queue after the promise resolves
-    promise.finally(() => {
-      fetchQueue.agentRuns.delete(threadId);
-    });
-    return promise;
-  },
-  
-  getQueuedThreads: (projectId: string) => fetchQueue.threads.get(projectId || 'all'),
-  setQueuedThreads: (projectId: string, promise: Promise<any>) => {
-    fetchQueue.threads.set(projectId || 'all', promise);
-    promise.finally(() => {
-      fetchQueue.threads.delete(projectId || 'all');
-    });
-    return promise;
-  },
-  
-  getQueuedMessages: (threadId: string) => fetchQueue.messages.get(threadId),
-  setQueuedMessages: (threadId: string, promise: Promise<any>) => {
-    fetchQueue.messages.set(threadId, promise);
-    promise.finally(() => {
-      fetchQueue.messages.delete(threadId);
-    });
-    return promise;
-  },
-  
-  getQueuedProjects: () => fetchQueue.projects.get('all'),
-  setQueuedProjects: (promise: Promise<any>) => {
-    fetchQueue.projects.set('all', promise);
-    promise.finally(() => {
-      fetchQueue.projects.delete('all');
-    });
-    return promise;
+// Custom error for billing issues
+export class BillingError extends Error {
+  status: number;
+  detail: { message: string; [key: string]: any }; // Allow other properties in detail
+
+  constructor(status: number, detail: { message: string; [key: string]: any }, message?: string) {
+    super(message || detail.message || `Billing Error: ${status}`);
+    this.name = 'BillingError';
+    this.status = status;
+    this.detail = detail;
+    
+    // Set the prototype explicitly.
+    Object.setPrototypeOf(this, BillingError.prototype);
   }
-};
+}
 
+// Type Definitions (moved from potential separate file for clarity)
 export type Project = {
   id: string;
   name: string;
   description: string;
   account_id: string;
   created_at: string;
+  updated_at?: string;
   sandbox: {
     vnc_preview?: string;
+    sandbox_url?: string;
     id?: string;
     pass?: string;
   };
+  is_public?: boolean; // Flag to indicate if the project is public
+  [key: string]: any; // Allow additional properties to handle database fields
 }
 
 export type Thread = {
   thread_id: string;
   account_id: string | null;
   project_id?: string | null;
+  is_public?: boolean;
   created_at: string;
   updated_at: string;
+  [key: string]: any; // Allow additional properties to handle database fields
 }
 
 export type Message = {
@@ -116,70 +73,156 @@ export type ToolCall = {
   arguments: Record<string, unknown>;
 }
 
+export interface InitiateAgentResponse {
+  thread_id: string;
+  agent_run_id: string;
+}
+
+export interface HealthCheckResponse {
+  status: string;
+  timestamp: string;
+  instance_id: string;
+}
+
+export interface FileInfo {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number;
+  mod_time: string;
+  permissions?: string;
+}
+
 // Project APIs
 export const getProjects = async (): Promise<Project[]> => {
-  // Check if we already have a pending request
-  const pendingRequest = fetchQueue.getQueuedProjects();
-  if (pendingRequest) {
-    return pendingRequest;
-  }
-  
-  // Check cache first
-  const cached = apiCache.getProjects();
-  if (cached) {
-    return cached;
-  }
-  
-  // Create and queue the promise
-  const fetchPromise = (async () => {
-    try {
-      const supabase = createClient();
-      const { data, error } = await supabase
-        .from('projects')
-        .select('*');
-      
-      if (error) {
-        // Handle permission errors specifically
-        if (error.code === '42501' && error.message.includes('has_role_on_account')) {
-          console.error('Permission error: User does not have proper account access');
-          return []; // Return empty array instead of throwing
-        }
-        throw error;
-      }
-      
-      // Cache the result
-      apiCache.setProjects(data || []);
-      return data || [];
-    } catch (err) {
-      console.error('Error fetching projects:', err);
-      // Return empty array for permission errors to avoid crashing the UI
+  try {
+    const supabase = createClient();
+    
+    // Get the current user's ID to filter projects
+    const { data: userData, error: userError } = await supabase.auth.getUser();
+    if (userError) {
+      console.error('Error getting current user:', userError);
       return [];
     }
-  })();
-  
-  // Add to queue and return
-  return fetchQueue.setQueuedProjects(fetchPromise);
+    
+    // If no user is logged in, return an empty array
+    if (!userData.user) {
+      console.log('[API] No user logged in, returning empty projects array');
+      return [];
+    }
+    
+    // Query only projects where account_id matches the current user's ID
+    const { data, error } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('account_id', userData.user.id);
+    
+    if (error) {
+      // Handle permission errors specifically
+      if (error.code === '42501' && error.message.includes('has_role_on_account')) {
+        console.error('Permission error: User does not have proper account access');
+        return []; // Return empty array instead of throwing
+      }
+      throw error;
+    }
+    
+    console.log('[API] Raw projects from DB:', data?.length, data);
+    
+    // Map database fields to our Project type 
+    const mappedProjects: Project[] = (data || []).map(project => ({
+      id: project.project_id,
+      name: project.name || '',
+      description: project.description || '',
+      account_id: project.account_id,
+      created_at: project.created_at,
+      updated_at: project.updated_at,
+      sandbox: project.sandbox || { id: "", pass: "", vnc_preview: "", sandbox_url: "" }
+    }));
+    
+    console.log('[API] Mapped projects for frontend:', mappedProjects.length);
+    
+    return mappedProjects;
+  } catch (err) {
+    console.error('Error fetching projects:', err);
+    // Return empty array for permission errors to avoid crashing the UI
+    return [];
+  }
 };
 
 export const getProject = async (projectId: string): Promise<Project> => {
-  // Check cache first
-  const cached = apiCache.getProject(projectId);
-  if (cached) {
-    return cached;
-  }
-  
   const supabase = createClient();
-  const { data, error } = await supabase
-    .from('projects')
-    .select('*')
-    .eq('project_id', projectId)
-    .single();
   
-  if (error) throw error;
-  
-  // Cache the result
-  apiCache.setProject(projectId, data);
-  return data;
+  try {
+    const { data, error } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('project_id', projectId)
+      .single();
+    
+    if (error) {
+      // Handle the specific "no rows returned" error from Supabase
+      if (error.code === 'PGRST116') {
+        throw new Error(`Project not found or not accessible: ${projectId}`);
+      }
+      throw error;
+    }
+
+    console.log('Raw project data from database:', data);
+
+    // If project has a sandbox, ensure it's started
+    if (data.sandbox?.id) {
+      // Fire off sandbox activation without blocking
+      const ensureSandboxActive = async () => {
+        try {
+          const { data: { session } } = await supabase.auth.getSession();
+          
+          // For public projects, we don't need authentication
+          const headers: Record<string, string> = {
+            'Content-Type': 'application/json'
+          };
+          
+          if (session?.access_token) {
+            headers['Authorization'] = `Bearer ${session.access_token}`;
+          }
+          
+          console.log(`Ensuring sandbox is active for project ${projectId}...`);
+          const response = await fetch(`${API_URL}/project/${projectId}/sandbox/ensure-active`, {
+            method: 'POST',
+            headers,
+          });
+          
+          if (!response.ok) {
+            const errorText = await response.text().catch(() => 'No error details available');
+            console.warn(`Failed to ensure sandbox is active: ${response.status} ${response.statusText}`, errorText);
+          } else {
+            console.log('Sandbox activation successful');
+          }
+        } catch (sandboxError) {
+          console.warn('Failed to ensure sandbox is active:', sandboxError);
+        }
+      };
+
+      // Start the sandbox activation without awaiting
+      ensureSandboxActive();
+    }
+    
+    // Map database fields to our Project type
+    const mappedProject: Project = {
+      id: data.project_id,
+      name: data.name || '',
+      description: data.description || '',
+      account_id: data.account_id,
+      created_at: data.created_at,
+      sandbox: data.sandbox || { id: "", pass: "", vnc_preview: "", sandbox_url: "" }
+    };
+    
+    console.log('Mapped project data for frontend:', mappedProject);
+    
+    return mappedProject;
+  } catch (error) {
+    console.error(`Error fetching project ${projectId}:`, error);
+    throw error;
+  }
 };
 
 export const createProject = async (
@@ -224,6 +267,16 @@ export const createProject = async (
 
 export const updateProject = async (projectId: string, data: Partial<Project>): Promise<Project> => {
   const supabase = createClient();
+  
+  console.log('Updating project with ID:', projectId);
+  console.log('Update data:', data);
+  
+  // Sanity check to avoid update errors
+  if (!projectId || projectId === '') {
+    console.error('Attempted to update project with invalid ID:', projectId);
+    throw new Error('Cannot update project: Invalid project ID');
+  }
+  
   const { data: updatedData, error } = await supabase
     .from('projects')
     .update(data)
@@ -239,10 +292,6 @@ export const updateProject = async (projectId: string, data: Partial<Project>): 
   if (!updatedData) {
     throw new Error('No data returned from update');
   }
-
-  // Invalidate cache after successful update
-  apiCache.projects.delete(projectId);
-  apiCache.projects.delete('all');
   
   // Dispatch a custom event to notify components about the project change
   if (typeof window !== 'undefined') {
@@ -250,7 +299,7 @@ export const updateProject = async (projectId: string, data: Partial<Project>): 
       detail: { 
         projectId, 
         updatedData: {
-          id: updatedData.project_id || updatedData.id,
+          id: updatedData.project_id,
           name: updatedData.name,
           description: updatedData.description
         }
@@ -258,7 +307,15 @@ export const updateProject = async (projectId: string, data: Partial<Project>): 
     }));
   }
   
-  return updatedData;
+  // Return formatted project data - use same mapping as getProject
+  return {
+    id: updatedData.project_id,
+    name: updatedData.name,
+    description: updatedData.description || '',
+    account_id: updatedData.account_id,
+    created_at: updatedData.created_at,
+    sandbox: updatedData.sandbox || { id: "", pass: "", vnc_preview: "", sandbox_url: "" }
+  };
 };
 
 export const deleteProject = async (projectId: string): Promise<void> => {
@@ -273,38 +330,50 @@ export const deleteProject = async (projectId: string): Promise<void> => {
 
 // Thread APIs
 export const getThreads = async (projectId?: string): Promise<Thread[]> => {
-  // Check if we already have a pending request
-  const pendingRequest = fetchQueue.getQueuedThreads(projectId || 'all');
-  if (pendingRequest) {
-    return pendingRequest;
+  const supabase = createClient();
+  
+  // Get the current user's ID to filter threads
+  const { data: userData, error: userError } = await supabase.auth.getUser();
+  if (userError) {
+    console.error('Error getting current user:', userError);
+    return [];
   }
   
-  // Check cache first
-  const cached = apiCache.getThreads(projectId || 'all');
-  if (cached) {
-    return cached;
+  // If no user is logged in, return an empty array
+  if (!userData.user) {
+    console.log('[API] No user logged in, returning empty threads array');
+    return [];
   }
   
-  // Create and queue the promise
-  const fetchPromise = (async () => {
-    const supabase = createClient();
-    let query = supabase.from('threads').select('*');
-    
-    if (projectId) {
-      query = query.eq('project_id', projectId);
-    }
-    
-    const { data, error } = await query;
-    
-    if (error) throw error;
-    
-    // Cache the result
-    apiCache.setThreads(projectId || 'all', data || []);
-    return data || [];
-  })();
+  let query = supabase.from('threads').select('*');
   
-  // Add to queue and return
-  return fetchQueue.setQueuedThreads(projectId || 'all', fetchPromise);
+  // Always filter by the current user's account ID
+  query = query.eq('account_id', userData.user.id);
+  
+  if (projectId) {
+    console.log('[API] Filtering threads by project_id:', projectId);
+    query = query.eq('project_id', projectId);
+  }
+  
+  const { data, error } = await query;
+  
+  if (error) {
+    console.error('[API] Error fetching threads:', error);
+    throw error;
+  }
+  
+  console.log('[API] Raw threads from DB:', data?.length, data);
+  
+  // Map database fields to ensure consistency with our Thread type
+  const mappedThreads: Thread[] = (data || []).map(thread => ({
+    thread_id: thread.thread_id,
+    account_id: thread.account_id,
+    project_id: thread.project_id,
+    created_at: thread.created_at,
+    updated_at: thread.updated_at
+  }));
+  
+  return mappedThreads;
 };
 
 export const getThread = async (threadId: string): Promise<Thread> => {
@@ -366,73 +435,39 @@ export const addUserMessage = async (threadId: string, content: string): Promise
     console.error('Error adding user message:', error);
     throw new Error(`Error adding message: ${error.message}`);
   }
-  
-  // Invalidate the cache for this thread's messages
-  apiCache.invalidateThreadMessages(threadId);
 };
 
 export const getMessages = async (threadId: string): Promise<Message[]> => {
-  // Check if we already have a pending request
-  const pendingRequest = fetchQueue.getQueuedMessages(threadId);
-  if (pendingRequest) {
-    return pendingRequest;
+  const supabase = createClient();
+  
+  const { data, error } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('thread_id', threadId)
+    .neq('type', 'cost')
+    .neq('type', 'summary')
+    .order('created_at', { ascending: true });
+  
+  if (error) {
+    console.error('Error fetching messages:', error);
+    throw new Error(`Error getting messages: ${error.message}`);
   }
+
+  console.log('[API] Messages fetched:', data);
   
-  // Check cache first
-  const cached = apiCache.getThreadMessages(threadId);
-  if (cached) {
-    return cached;
-  }
-  
-  // Create and queue the promise
-  const fetchPromise = (async () => {
-    const supabase = createClient();
-    
-    const { data, error } = await supabase
-      .from('messages')
-      .select('*')
-      .eq('thread_id', threadId)
-      .neq('type', 'cost')
-      .neq('type', 'summary')
-      .order('created_at', { ascending: true });
-    
-    if (error) {
-      console.error('Error fetching messages:', error);
-      throw new Error(`Error getting messages: ${error.message}`);
-    }
-    
-    // Process the messages to the expected format
-    const messages = (data || []).map(msg => {
-      try {
-        // Parse the content from JSONB
-        const content = typeof msg.content === 'string' 
-          ? JSON.parse(msg.content) 
-          : msg.content;
-          
-        // Return in the format the app expects
-        return content;
-      } catch (e) {
-        console.error('Error parsing message content:', e, msg);
-        // Fallback for malformed messages
-        return {
-          role: msg.is_llm_message ? 'assistant' : 'user',
-          content: 'Error: Could not parse message content'
-        };
-      }
-    });
-    
-    // Cache the result
-    apiCache.setThreadMessages(threadId, messages);
-    
-    return messages;
-  })();
-  
-  // Add to queue and return
-  return fetchQueue.setQueuedMessages(threadId, fetchPromise);
+  return data || [];
 };
 
 // Agent APIs
-export const startAgent = async (threadId: string): Promise<{ agent_run_id: string }> => {
+export const startAgent = async (
+  threadId: string, 
+  options?: {
+    model_name?: string;
+    enable_thinking?: boolean;
+    reasoning_effort?: string;
+    stream?: boolean;
+  }
+): Promise<{ agent_run_id: string }> => {
   try {
     const supabase = createClient();
     const { data: { session } } = await supabase.auth.getSession();
@@ -454,20 +489,44 @@ export const startAgent = async (threadId: string): Promise<{ agent_run_id: stri
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${session.access_token}`,
       },
+      // Add cache: 'no-store' to prevent caching
+      cache: 'no-store',
+      // Add the body, stringifying the options or an empty object
+      body: JSON.stringify(options || {}),
     });
     
     if (!response.ok) {
+      // Check for 402 Payment Required first
+      if (response.status === 402) {
+        try {
+          const errorData = await response.json();
+          console.error(`[API] Billing error starting agent (402):`, errorData);
+          // Ensure detail exists and has a message property
+          const detail = errorData?.detail || { message: 'Payment Required' };
+          if (typeof detail.message !== 'string') {
+            detail.message = 'Payment Required'; // Default message if missing
+          }
+          throw new BillingError(response.status, detail);
+        } catch (parseError) {
+          // Handle cases where parsing fails or the structure isn't as expected
+          console.error('[API] Could not parse 402 error response body:', parseError);
+          throw new BillingError(response.status, { message: 'Payment Required' }, `Error starting agent: ${response.statusText} (402)`);
+        }
+      }
+      
+      // Handle other errors
       const errorText = await response.text().catch(() => 'No error details available');
       console.error(`[API] Error starting agent: ${response.status} ${response.statusText}`, errorText);
       throw new Error(`Error starting agent: ${response.statusText} (${response.status})`);
     }
     
-    // Invalidate relevant caches
-    apiCache.invalidateAgentRuns(threadId);
-    apiCache.invalidateThreadMessages(threadId);
-    
     return response.json();
   } catch (error) {
+    // Rethrow BillingError instances directly
+    if (error instanceof BillingError) {
+      throw error;
+    }
+    
     console.error('[API] Failed to start agent:', error);
     
     // Provide clearer error message for network errors
@@ -475,11 +534,23 @@ export const startAgent = async (threadId: string): Promise<{ agent_run_id: stri
       throw new Error(`Cannot connect to backend server. Please check your internet connection and make sure the backend is running.`);
     }
     
+    // Rethrow other caught errors
     throw error;
   }
 };
 
 export const stopAgent = async (agentRunId: string): Promise<void> => {
+  // Add to non-running set immediately to prevent reconnection attempts
+  nonRunningAgentRuns.add(agentRunId);
+  
+  // Close any existing stream
+  const existingStream = activeStreams.get(agentRunId);
+  if (existingStream) {
+    console.log(`[API] Closing existing stream for ${agentRunId} before stopping agent`);
+    existingStream.close();
+    activeStreams.delete(agentRunId);
+  }
+  
   const supabase = createClient();
   const { data: { session } } = await supabase.auth.getSession();
   
@@ -493,6 +564,8 @@ export const stopAgent = async (agentRunId: string): Promise<void> => {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${session.access_token}`,
     },
+    // Add cache: 'no-store' to prevent caching
+    cache: 'no-store',
   });
   
   if (!response.ok) {
@@ -501,56 +574,63 @@ export const stopAgent = async (agentRunId: string): Promise<void> => {
 };
 
 export const getAgentStatus = async (agentRunId: string): Promise<AgentRun> => {
-  console.log(`[API] ⚠️ Requesting agent status for ${agentRunId}`);
+  console.log(`[API] Requesting agent status for ${agentRunId}`);
+  
+  // If we already know this agent is not running, throw an error
+  if (nonRunningAgentRuns.has(agentRunId)) {
+    console.log(`[API] Agent run ${agentRunId} is known to be non-running, returning error`);
+    throw new Error(`Agent run ${agentRunId} is not running`);
+  }
   
   try {
     const supabase = createClient();
     const { data: { session } } = await supabase.auth.getSession();
     
     if (!session?.access_token) {
-      console.error('[API] ❌ No access token available for getAgentStatus');
+      console.error('[API] No access token available for getAgentStatus');
       throw new Error('No access token available');
     }
 
     const url = `${API_URL}/agent-run/${agentRunId}`;
-    console.log(`[API] 🔍 Fetching from: ${url}`);
+    console.log(`[API] Fetching from: ${url}`);
     
     const response = await fetch(url, {
       headers: {
         'Authorization': `Bearer ${session.access_token}`,
       },
+      // Add cache: 'no-store' to prevent caching
+      cache: 'no-store',
     });
     
     if (!response.ok) {
       const errorText = await response.text().catch(() => 'No error details available');
-      console.error(`[API] ❌ Error getting agent status: ${response.status} ${response.statusText}`, errorText);
+      console.error(`[API] Error getting agent status: ${response.status} ${response.statusText}`, errorText);
+      
+      // If we get a 404, add to non-running set
+      if (response.status === 404) {
+        nonRunningAgentRuns.add(agentRunId);
+      }
+      
       throw new Error(`Error getting agent status: ${response.statusText} (${response.status})`);
     }
     
     const data = await response.json();
-    console.log(`[API] ✅ Successfully got agent status:`, data);
+    console.log(`[API] Successfully got agent status:`, data);
+    
+    // If agent is not running, add to non-running set
+    if (data.status !== 'running') {
+      nonRunningAgentRuns.add(agentRunId);
+    }
+    
     return data;
   } catch (error) {
-    console.error('[API] ❌ Failed to get agent status:', error);
+    console.error('[API] Failed to get agent status:', error);
     throw error;
   }
 };
 
 export const getAgentRuns = async (threadId: string): Promise<AgentRun[]> => {
-  // Check if we already have a pending request for this thread ID
-  const pendingRequest = fetchQueue.getQueuedAgentRuns(threadId);
-  if (pendingRequest) {
-    return pendingRequest;
-  }
-  
-  // Check cache first
-  const cached = apiCache.getAgentRuns(threadId);
-  if (cached) {
-    return cached;
-  }
-  
-  // Create and queue the promise to prevent duplicate requests
-  const fetchPromise = (async () => {
+  try {
     const supabase = createClient();
     const { data: { session } } = await supabase.auth.getSession();
     
@@ -562,6 +642,8 @@ export const getAgentRuns = async (threadId: string): Promise<AgentRun[]> => {
       headers: {
         'Authorization': `Bearer ${session.access_token}`,
       },
+      // Add cache: 'no-store' to prevent caching
+      cache: 'no-store',
     });
     
     if (!response.ok) {
@@ -569,15 +651,11 @@ export const getAgentRuns = async (threadId: string): Promise<AgentRun[]> => {
     }
     
     const data = await response.json();
-    const agentRuns = data.agent_runs || [];
-    
-    // Cache the result
-    apiCache.setAgentRuns(threadId, agentRuns);
-    return agentRuns;
-  })();
-  
-  // Add to queue and return
-  return fetchQueue.setQueuedAgentRuns(threadId, fetchPromise);
+    return data.agent_runs || [];
+  } catch (error) {
+    console.error('Failed to get agent runs:', error);
+    throw error;
+  }
 };
 
 export const streamAgent = (agentRunId: string, callbacks: {
@@ -585,15 +663,58 @@ export const streamAgent = (agentRunId: string, callbacks: {
   onError: (error: Error | string) => void;
   onClose: () => void;
 }): () => void => {
-  let eventSourceInstance: EventSource | null = null;
-  let isClosing = false;
+  console.log(`[STREAM] streamAgent called for ${agentRunId}`);
   
-  console.log(`[STREAM] Setting up stream for agent run ${agentRunId}`);
+  // Check if this agent run is known to be non-running
+  if (nonRunningAgentRuns.has(agentRunId)) {
+    console.log(`[STREAM] Agent run ${agentRunId} is known to be non-running, not creating stream`);
+    // Notify the caller immediately
+    setTimeout(() => {
+      callbacks.onError(`Agent run ${agentRunId} is not running`);
+      callbacks.onClose();
+    }, 0);
+    
+    // Return a no-op cleanup function
+    return () => {};
+  }
   
-  const setupStream = async () => {
-    try {
-      if (isClosing) {
-        console.log(`[STREAM] Already closing, not setting up stream for ${agentRunId}`);
+  // Check if there's already an active stream for this agent run
+  const existingStream = activeStreams.get(agentRunId);
+  if (existingStream) {
+    console.log(`[STREAM] Stream already exists for ${agentRunId}, closing it first`);
+    existingStream.close();
+    activeStreams.delete(agentRunId);
+  }
+  
+  // Set up a new stream
+  try {
+    const setupStream = async () => {
+      // First verify the agent is actually running
+      try {
+        const status = await getAgentStatus(agentRunId);
+        if (status.status !== 'running') {
+          console.log(`[STREAM] Agent run ${agentRunId} is not running (status: ${status.status}), not creating stream`);
+          nonRunningAgentRuns.add(agentRunId);
+          callbacks.onError(`Agent run ${agentRunId} is not running (status: ${status.status})`);
+          callbacks.onClose();
+          return;
+        }
+      } catch (err) {
+        console.error(`[STREAM] Error verifying agent run ${agentRunId}:`, err);
+        
+        // Check if this is a "not found" error
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        const isNotFoundError = errorMessage.includes('not found') || 
+                               errorMessage.includes('404') || 
+                               errorMessage.includes('does not exist');
+        
+        if (isNotFoundError) {
+          console.log(`[STREAM] Agent run ${agentRunId} not found, not creating stream`);
+          nonRunningAgentRuns.add(agentRunId);
+        }
+        
+        callbacks.onError(errorMessage);
+        callbacks.onClose();
         return;
       }
       
@@ -602,7 +723,7 @@ export const streamAgent = (agentRunId: string, callbacks: {
       
       if (!session?.access_token) {
         console.error('[STREAM] No auth token available');
-        callbacks.onError('Authentication required');
+        callbacks.onError(new Error('Authentication required'));
         callbacks.onClose();
         return;
       }
@@ -611,151 +732,156 @@ export const streamAgent = (agentRunId: string, callbacks: {
       url.searchParams.append('token', session.access_token);
       
       console.log(`[STREAM] Creating EventSource for ${agentRunId}`);
-      eventSourceInstance = new EventSource(url.toString());
+      const eventSource = new EventSource(url.toString());
       
-      eventSourceInstance.onopen = () => {
+      // Store the EventSource in the active streams map
+      activeStreams.set(agentRunId, eventSource);
+      
+      eventSource.onopen = () => {
         console.log(`[STREAM] Connection opened for ${agentRunId}`);
       };
       
-      eventSourceInstance.onmessage = (event) => {
+      eventSource.onmessage = (event) => {
         try {
           const rawData = event.data;
           if (rawData.includes('"type":"ping"')) return;
           
+          // Log raw data for debugging (truncated for readability)
+          console.log(`[STREAM] Received data for ${agentRunId}: ${rawData.substring(0, 100)}${rawData.length > 100 ? '...' : ''}`);
+          
           // Skip empty messages
-          if (!rawData || rawData.trim() === '') return;
+          if (!rawData || rawData.trim() === '') {
+            console.debug('[STREAM] Received empty message, skipping');
+            return;
+          }
           
-          // Log raw data for debugging
-          console.log(`[STREAM] Received data: ${rawData.substring(0, 100)}${rawData.length > 100 ? '...' : ''}`);
-
-          let jsonData;
-          try {
-            jsonData = JSON.parse(rawData);
-          } catch (parseError) {
-            console.error('[STREAM] Failed to parse message:', parseError);
-            return;
-          }
-
-          // Handle stream errors and failures first
-          if (jsonData.status === 'error' || (jsonData.type === 'status' && jsonData.status === 'failed')) {
-            // Get a clean string version of any error message
-            const errorMessage = typeof jsonData.message === 'object'
-              ? JSON.stringify(jsonData.message)
-              : String(jsonData.message || 'Stream failed');
+          // Check for "Agent run not found" error
+          if (rawData.includes('Agent run') && rawData.includes('not found in active runs')) {
+            console.log(`[STREAM] Agent run ${agentRunId} not found in active runs, closing stream`);
             
-            // Only log to console if it's an unexpected error (not a known API error response)
-            if (jsonData.status !== 'error') {
-              console.error(`[STREAM] Stream error for ${agentRunId}:`, errorMessage);
-            }
+            // Add to non-running set to prevent future reconnection attempts
+            nonRunningAgentRuns.add(agentRunId);
             
-            // Ensure we close the stream and prevent reconnection
-            if (!isClosing) {
-              isClosing = true;
-              if (eventSourceInstance) {
-                eventSourceInstance.close();
-                eventSourceInstance = null;
-              }
-              callbacks.onError(errorMessage);
-              callbacks.onClose();
-            }
-            return;
-          }
-
-          // Handle completion status
-          if (jsonData.type === 'status' && jsonData.status === 'completed') {
-            console.log(`[STREAM] Completion message received for ${agentRunId}`);
+            // Notify about the error
+            callbacks.onError("Agent run not found in active runs");
             
-            if (!isClosing) {
-              isClosing = true;
-              callbacks.onMessage(rawData);
-              if (eventSourceInstance) {
-                eventSourceInstance.close();
-                eventSourceInstance = null;
-              }
-              callbacks.onClose();
-            }
-            return;
-          }
-
-          // Pass other messages normally
-          if (!isClosing) {
-            callbacks.onMessage(rawData);
-          }
-        } catch (error) {
-          console.error(`[STREAM] Error in message handler:`, error);
-          
-          if (!isClosing) {
-            isClosing = true;
-            if (eventSourceInstance) {
-              eventSourceInstance.close();
-              eventSourceInstance = null;
-            }
-            callbacks.onError(error instanceof Error ? error.message : 'Stream processing error');
+            // Clean up
+            eventSource.close();
+            activeStreams.delete(agentRunId);
             callbacks.onClose();
+            
+            return;
           }
+          
+          // Check for completion messages
+          if (rawData.includes('"type":"status"') && rawData.includes('"status":"completed"')) {
+            console.log(`[STREAM] Detected completion status message for ${agentRunId}`);
+            
+            // Check for specific completion messages that indicate we should stop checking
+            if (rawData.includes('Run data not available for streaming') || 
+                rawData.includes('Stream ended with status: completed')) {
+              console.log(`[STREAM] Detected final completion message for ${agentRunId}, adding to non-running set`);
+              // Add to non-running set to prevent future reconnection attempts
+              nonRunningAgentRuns.add(agentRunId);
+            }
+            
+            // Notify about the message
+            callbacks.onMessage(rawData);
+            
+            // Clean up
+            eventSource.close();
+            activeStreams.delete(agentRunId);
+            callbacks.onClose();
+            
+            return;
+          }
+          
+          // Check for thread run end message
+          if (rawData.includes('"type":"status"') && rawData.includes('"status_type":"thread_run_end"')) {
+            console.log(`[STREAM] Detected thread run end message for ${agentRunId}`);
+            
+            // Add to non-running set
+            nonRunningAgentRuns.add(agentRunId);
+            
+            // Notify about the message
+            callbacks.onMessage(rawData);
+            
+            // Clean up
+            eventSource.close();
+            activeStreams.delete(agentRunId);
+            callbacks.onClose();
+            
+            return;
+          }
+          
+          // For all other messages, just pass them through
+          callbacks.onMessage(rawData);
+          
+        } catch (error) {
+          console.error(`[STREAM] Error handling message:`, error);
+          callbacks.onError(error instanceof Error ? error : String(error));
         }
       };
       
-      eventSourceInstance.onerror = (event) => {
-        // Add detailed event logging
-        console.log(`[STREAM] 🔍 EventSource onerror triggered for ${agentRunId}`, event);
+      eventSource.onerror = (event) => {
+        console.log(`[STREAM] EventSource error for ${agentRunId}:`, event);
         
-        // For clean closures (manual or completed), we don't need to log an error
-        if (isClosing) {
-          console.log(`[STREAM] EventSource closed as expected for ${agentRunId}`);
-          return;
-        }
-        
-        // Only log as error for unexpected closures
-        console.error(`[STREAM] EventSource connection error/closed unexpectedly for ${agentRunId}`);
-        
-        if (!isClosing) {
-          console.log(`[STREAM] Handling unexpected connection close for ${agentRunId}`);
-          
-          // Close the connection
-          if (eventSourceInstance) {
-            eventSourceInstance.close();
-            eventSourceInstance = null;
-          }
-          
-          // Then notify error and close (once)
-          isClosing = true;
-          callbacks.onError(new Error('Stream connection closed unexpectedly.')); // Add error callback
-          callbacks.onClose();
-        }
+        // Check if the agent is still running
+        getAgentStatus(agentRunId)
+          .then(status => {
+            if (status.status !== 'running') {
+              console.log(`[STREAM] Agent run ${agentRunId} is not running after error, closing stream`);
+              nonRunningAgentRuns.add(agentRunId);
+              eventSource.close();
+              activeStreams.delete(agentRunId);
+              callbacks.onClose();
+            } else {
+              console.log(`[STREAM] Agent run ${agentRunId} is still running after error, keeping stream open`);
+              // Let the browser handle reconnection for non-fatal errors
+            }
+          })
+          .catch(err => {
+            console.error(`[STREAM] Error checking agent status after stream error:`, err);
+            
+            // Check if this is a "not found" error
+            const errMsg = err instanceof Error ? err.message : String(err);
+            const isNotFoundErr = errMsg.includes('not found') || 
+                                 errMsg.includes('404') || 
+                                 errMsg.includes('does not exist');
+            
+            if (isNotFoundErr) {
+              console.log(`[STREAM] Agent run ${agentRunId} not found after error, closing stream`);
+              nonRunningAgentRuns.add(agentRunId);
+              eventSource.close();
+              activeStreams.delete(agentRunId);
+              callbacks.onClose();
+            }
+            
+            // For other errors, notify but don't close the stream
+            callbacks.onError(errMsg);
+          });
       };
-      
-    } catch (error) {
-      console.error(`[STREAM] Error setting up stream:`, error);
-      
-      if (!isClosing) {
-        isClosing = true;
-        callbacks.onError(error instanceof Error ? error : String(error));
-        callbacks.onClose();
+    };
+    
+    // Start the stream setup
+    setupStream();
+    
+    // Return a cleanup function
+    return () => {
+      console.log(`[STREAM] Cleanup called for ${agentRunId}`);
+      const stream = activeStreams.get(agentRunId);
+      if (stream) {
+        console.log(`[STREAM] Closing stream for ${agentRunId}`);
+        stream.close();
+        activeStreams.delete(agentRunId);
       }
-    }
-  };
-  
-  // Set up the stream once
-  setupStream();
-  
-  // Return cleanup function
-  return () => {
-    console.log(`[STREAM] Manual cleanup called for ${agentRunId}`);
-    
-    if (isClosing) {
-      console.log(`[STREAM] Already closing, ignoring duplicate cleanup for ${agentRunId}`);
-      return;
-    }
-    
-    isClosing = true;
-    
-    if (eventSourceInstance) {
-      console.log(`[STREAM] Manually closing EventSource for ${agentRunId}`);
-      eventSourceInstance.close();
-      eventSourceInstance = null;
-    }
-  };
+    };
+  } catch (error) {
+    console.error(`[STREAM] Error setting up stream for ${agentRunId}:`, error);
+    callbacks.onError(error instanceof Error ? error : String(error));
+    callbacks.onClose();
+    return () => {};
+  }
 };
 
 // Sandbox API Functions
@@ -764,26 +890,23 @@ export const createSandboxFile = async (sandboxId: string, filePath: string, con
     const supabase = createClient();
     const { data: { session } } = await supabase.auth.getSession();
     
-    if (!session?.access_token) {
-      throw new Error('No access token available');
+    // Use FormData to handle both text and binary content more reliably
+    const formData = new FormData();
+    formData.append('path', filePath);
+    
+    // Create a Blob from the content string and append as a file
+    const blob = new Blob([content], { type: 'application/octet-stream' });
+    formData.append('file', blob, filePath.split('/').pop() || 'file');
+
+    const headers: Record<string, string> = {};
+    if (session?.access_token) {
+      headers['Authorization'] = `Bearer ${session.access_token}`;
     }
 
-    // Determine if content is likely binary (contains non-printable characters)
-    const isProbablyBinary = /[\x00-\x08\x0E-\x1F\x80-\xFF]/.test(content) ||
-                            content.startsWith('data:') || 
-                            /^[A-Za-z0-9+/]*={0,2}$/.test(content);
-    
     const response = await fetch(`${API_URL}/sandboxes/${sandboxId}/files`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${session.access_token}`,
-      },
-      body: JSON.stringify({
-        path: filePath,
-        content: content,
-        is_base64: isProbablyBinary
-      }),
+      headers,
+      body: formData,
     });
     
     if (!response.ok) {
@@ -799,31 +922,57 @@ export const createSandboxFile = async (sandboxId: string, filePath: string, con
   }
 };
 
-export interface FileInfo {
-  name: string;
-  path: string;
-  is_dir: boolean;
-  size: number;
-  mod_time: string;
-  permissions?: string;
-}
+// Fallback method for legacy support using JSON
+export const createSandboxFileJson = async (sandboxId: string, filePath: string, content: string): Promise<void> => {
+  try {
+    const supabase = createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+    };
+    
+    if (session?.access_token) {
+      headers['Authorization'] = `Bearer ${session.access_token}`;
+    }
+
+    const response = await fetch(`${API_URL}/sandboxes/${sandboxId}/files/json`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        path: filePath,
+        content: content
+      }),
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'No error details available');
+      console.error(`Error creating sandbox file (JSON): ${response.status} ${response.statusText}`, errorText);
+      throw new Error(`Error creating sandbox file: ${response.statusText} (${response.status})`);
+    }
+    
+    return response.json();
+  } catch (error) {
+    console.error('Failed to create sandbox file with JSON:', error);
+    throw error;
+  }
+};
 
 export const listSandboxFiles = async (sandboxId: string, path: string): Promise<FileInfo[]> => {
   try {
     const supabase = createClient();
     const { data: { session } } = await supabase.auth.getSession();
     
-    if (!session?.access_token) {
-      throw new Error('No access token available');
-    }
-
     const url = new URL(`${API_URL}/sandboxes/${sandboxId}/files`);
     url.searchParams.append('path', path);
 
+    const headers: Record<string, string> = {};
+    if (session?.access_token) {
+      headers['Authorization'] = `Bearer ${session.access_token}`;
+    }
+
     const response = await fetch(url.toString(), {
-      headers: {
-        'Authorization': `Bearer ${session.access_token}`,
-      },
+      headers,
     });
     
     if (!response.ok) {
@@ -845,17 +994,16 @@ export const getSandboxFileContent = async (sandboxId: string, path: string): Pr
     const supabase = createClient();
     const { data: { session } } = await supabase.auth.getSession();
     
-    if (!session?.access_token) {
-      throw new Error('No access token available');
-    }
-
     const url = new URL(`${API_URL}/sandboxes/${sandboxId}/files/content`);
     url.searchParams.append('path', path);
 
+    const headers: Record<string, string> = {};
+    if (session?.access_token) {
+      headers['Authorization'] = `Bearer ${session.access_token}`;
+    }
+
     const response = await fetch(url.toString(), {
-      headers: {
-        'Authorization': `Bearer ${session.access_token}`,
-      },
+      headers,
     });
     
     if (!response.ok) {
@@ -877,60 +1025,354 @@ export const getSandboxFileContent = async (sandboxId: string, path: string): Pr
   }
 };
 
-export const generateThreadName = async (message: string): Promise<string> => {
+export const updateThread = async (threadId: string, data: Partial<Thread>): Promise<Thread> => {
+  const supabase = createClient();
+  
+  // Format the data for update
+  const updateData = { ...data };
+  
+  // Update the thread
+  const { data: updatedThread, error } = await supabase
+    .from('threads')
+    .update(updateData)
+    .eq('thread_id', threadId)
+    .select()
+    .single();
+  
+  if (error) {
+    console.error('Error updating thread:', error);
+    throw new Error(`Error updating thread: ${error.message}`);
+  }
+  
+  return updatedThread;
+};
+
+export const toggleThreadPublicStatus = async (threadId: string, isPublic: boolean): Promise<Thread> => {
+  return updateThread(threadId, { is_public: isPublic });
+};
+
+// Function to get public projects
+export const getPublicProjects = async (): Promise<Project[]> => {
   try {
-    // Default name in case the API fails
-    const defaultName = message.trim().length > 50 
-      ? message.trim().substring(0, 47) + "..." 
-      : message.trim();
+    const supabase = createClient();
     
-    // OpenAI API key should be stored in an environment variable
-    const apiKey = process.env.NEXT_PUBLIC_OPENAI_API_KEY;
+    // Query for threads that are marked as public
+    const { data: publicThreads, error: threadsError } = await supabase
+      .from('threads')
+      .select('project_id')
+      .eq('is_public', true);
     
-    if (!apiKey) {
-      console.error('OpenAI API key not found');
-      return defaultName;
+    if (threadsError) {
+      console.error('Error fetching public threads:', threadsError);
+      return [];
     }
     
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    // If no public threads found, return empty array
+    if (!publicThreads?.length) {
+      return [];
+    }
+    
+    // Extract unique project IDs from public threads
+    const publicProjectIds = [...new Set(publicThreads.map(thread => thread.project_id))].filter(Boolean);
+    
+    // If no valid project IDs, return empty array
+    if (!publicProjectIds.length) {
+      return [];
+    }
+    
+    // Get the projects that have public threads
+    const { data: projects, error: projectsError } = await supabase
+      .from('projects')
+      .select('*')
+      .in('project_id', publicProjectIds);
+    
+    if (projectsError) {
+      console.error('Error fetching public projects:', projectsError);
+      return [];
+    }
+    
+    console.log('[API] Raw public projects from DB:', projects?.length, projects);
+    
+    // Map database fields to our Project type
+    const mappedProjects: Project[] = (projects || []).map(project => ({
+      id: project.project_id,
+      name: project.name || '',
+      description: project.description || '',
+      account_id: project.account_id,
+      created_at: project.created_at,
+      updated_at: project.updated_at,
+      sandbox: project.sandbox || { id: "", pass: "", vnc_preview: "", sandbox_url: "" },
+      is_public: true // Mark these as public projects
+    }));
+    
+    console.log('[API] Mapped public projects for frontend:', mappedProjects.length);
+    
+    return mappedProjects;
+  } catch (err) {
+    console.error('Error fetching public projects:', err);
+    return [];
+  }
+};
+
+export const initiateAgent = async (formData: FormData): Promise<InitiateAgentResponse> => {
+  try {
+    const supabase = createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    
+    if (!session?.access_token) {
+      throw new Error('No access token available');
+    }
+
+    // Check if backend URL is configured
+    if (!API_URL) {
+      throw new Error('Backend URL is not configured. Set NEXT_PUBLIC_BACKEND_URL in your environment.');
+    }
+
+    console.log(`[API] Initiating agent with files using ${API_URL}/agent/initiate`);
+    
+    const response = await fetch(`${API_URL}/agent/initiate`, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
+        // Note: Don't set Content-Type for FormData
+        'Authorization': `Bearer ${session.access_token}`,
       },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a helpful assistant that generates extremely concise titles (2-4 words maximum) for chat threads based on the user\'s message. Respond with only the title, no other text or punctuation.'
-          },
-          {
-            role: 'user',
-            content: `Generate an extremely brief title (2-4 words only) for a chat thread that starts with this message: "${message}"`
-          }
-        ],
-        max_tokens: 20,
-        temperature: 0.7
-      })
+      body: formData,
+      // Add cache: 'no-store' to prevent caching
+      cache: 'no-store',
     });
     
     if (!response.ok) {
-      const errorData = await response.text();
-      console.error('OpenAI API error:', errorData);
-      return defaultName;
+      const errorText = await response.text().catch(() => 'No error details available');
+      console.error(`[API] Error initiating agent: ${response.status} ${response.statusText}`, errorText);
+      throw new Error(`Error initiating agent: ${response.statusText} (${response.status})`);
+    }
+    
+    return response.json();
+  } catch (error) {
+    console.error('[API] Failed to initiate agent:', error);
+    
+    // Provide clearer error message for network errors
+    if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
+      throw new Error(`Cannot connect to backend server. Please check your internet connection and make sure the backend is running.`);
+    }
+    
+    throw error;
+  }
+};
+
+export const checkApiHealth = async (): Promise<HealthCheckResponse> => {
+  try {
+    const response = await fetch(`${API_URL}/health`, {
+      cache: 'no-store',
+    });
+    
+    if (!response.ok) {
+      throw new Error(`API health check failed: ${response.statusText}`);
+    }
+    
+    return response.json();
+  } catch (error) {
+    console.error('API health check failed:', error);
+    throw error;
+  }
+};
+
+// Billing API Types
+export interface CreateCheckoutSessionRequest {
+  price_id: string;
+  success_url: string;
+  cancel_url: string;
+}
+
+export interface CreatePortalSessionRequest {
+  return_url: string;
+}
+
+export interface SubscriptionStatus {
+  status: string; // Includes 'active', 'trialing', 'past_due', 'scheduled_downgrade', 'no_subscription'
+  plan_name?: string;
+  price_id?: string; // Added
+  current_period_end?: string; // ISO Date string
+  cancel_at_period_end: boolean;
+  trial_end?: string; // ISO Date string
+  minutes_limit?: number;
+  current_usage?: number;
+  // Fields for scheduled changes
+  has_schedule: boolean;
+  scheduled_plan_name?: string;
+  scheduled_price_id?: string; // Added
+  scheduled_change_date?: string; // ISO Date string - Deprecate? Check backend usage
+  schedule_effective_date?: string; // ISO Date string - Added for consistency
+}
+
+export interface BillingStatusResponse {
+  can_run: boolean;
+  message: string;
+  subscription: {
+    price_id: string;
+    plan_name: string;
+    minutes_limit?: number;
+  };
+}
+
+export interface CreateCheckoutSessionResponse {
+  status: 'upgraded' | 'downgrade_scheduled' | 'checkout_created' | 'no_change' | 'new' | 'updated' | 'scheduled';
+  subscription_id?: string;
+  schedule_id?: string;
+  session_id?: string;
+  url?: string;
+  effective_date?: string;
+  message?: string;
+  details?: {
+    is_upgrade?: boolean;
+    effective_date?: string;
+    current_price?: number;
+    new_price?: number;
+    invoice?: {
+      id: string;
+      status: string;
+      amount_due: number;
+      amount_paid: number;
+    };
+  };
+}
+
+// Billing API Functions
+export const createCheckoutSession = async (request: CreateCheckoutSessionRequest): Promise<CreateCheckoutSessionResponse> => {
+  try {
+    const supabase = createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    
+    if (!session?.access_token) {
+      throw new Error('No access token available');
+    }
+
+    const response = await fetch(`${API_URL}/billing/create-checkout-session`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${session.access_token}`,
+      },
+      body: JSON.stringify(request),
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'No error details available');
+      console.error(`Error creating checkout session: ${response.status} ${response.statusText}`, errorText);
+      throw new Error(`Error creating checkout session: ${response.statusText} (${response.status})`);
     }
     
     const data = await response.json();
-    const generatedName = data.choices[0]?.message?.content?.trim();
+    console.log('Checkout session response:', data);
     
-    // Return the generated name or default if empty
-    return generatedName || defaultName;
+    // Handle all possible statuses
+    switch (data.status) {
+      case 'upgraded':
+      case 'updated':
+      case 'downgrade_scheduled':
+      case 'scheduled':
+      case 'no_change':
+        return data;
+      case 'new':
+      case 'checkout_created':
+        if (!data.url) {
+          throw new Error('No checkout URL provided');
+        }
+        return data;
+      default:
+        console.warn('Unexpected status from createCheckoutSession:', data.status);
+        return data;
+    }
   } catch (error) {
-    console.error('Error generating thread name:', error);
-    // Fall back to using a truncated version of the message
-    return message.trim().length > 50 
-      ? message.trim().substring(0, 47) + "..." 
-      : message.trim();
+    console.error('Failed to create checkout session:', error);
+    throw error;
   }
 };
+
+export const createPortalSession = async (request: CreatePortalSessionRequest): Promise<{ url: string }> => {
+  try {
+    const supabase = createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    
+    if (!session?.access_token) {
+      throw new Error('No access token available');
+    }
+
+    const response = await fetch(`${API_URL}/billing/create-portal-session`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${session.access_token}`,
+      },
+      body: JSON.stringify(request),
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'No error details available');
+      console.error(`Error creating portal session: ${response.status} ${response.statusText}`, errorText);
+      throw new Error(`Error creating portal session: ${response.statusText} (${response.status})`);
+    }
+    
+    return response.json();
+  } catch (error) {
+    console.error('Failed to create portal session:', error);
+    throw error;
+  }
+};
+
+export const getSubscription = async (): Promise<SubscriptionStatus> => {
+  try {
+    const supabase = createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    
+    if (!session?.access_token) {
+      throw new Error('No access token available');
+    }
+
+    const response = await fetch(`${API_URL}/billing/subscription`, {
+      headers: {
+        'Authorization': `Bearer ${session.access_token}`,
+      },
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'No error details available');
+      console.error(`Error getting subscription: ${response.status} ${response.statusText}`, errorText);
+      throw new Error(`Error getting subscription: ${response.statusText} (${response.status})`);
+    }
+    
+    return response.json();
+  } catch (error) {
+    console.error('Failed to get subscription:', error);
+    throw error;
+  }
+};
+
+export const checkBillingStatus = async (): Promise<BillingStatusResponse> => {
+  try {
+    const supabase = createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    
+    if (!session?.access_token) {
+      throw new Error('No access token available');
+    }
+
+    const response = await fetch(`${API_URL}/billing/check-status`, {
+      headers: {
+        'Authorization': `Bearer ${session.access_token}`,
+      },
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'No error details available');
+      console.error(`Error checking billing status: ${response.status} ${response.statusText}`, errorText);
+      throw new Error(`Error checking billing status: ${response.statusText} (${response.status})`);
+    }
+    
+    return response.json();
+  } catch (error) {
+    console.error('Failed to check billing status:', error);
+    throw error;
+  }
+};
+

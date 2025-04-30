@@ -1,12 +1,14 @@
 "use client";
 
-import React from "react";
+import React, { forwardRef } from "react";
 import { cn } from "@/lib/utils";
 import { MarkdownRenderer } from "./markdown-renderer";
 import { CodeRenderer } from "./code-renderer";
 import { PdfRenderer } from "./pdf-renderer";
 import { ImageRenderer } from "./image-renderer";
 import { BinaryRenderer } from "./binary-renderer";
+import { HtmlRenderer } from "./html-renderer";
+import { constructHtmlPreviewUrl } from "@/lib/utils/url";
 
 export type FileType = 
   | 'markdown'
@@ -21,6 +23,14 @@ interface FileRendererProps {
   binaryUrl: string | null;
   fileName: string;
   className?: string;
+  project?: {
+    sandbox?: {
+      sandbox_url?: string;
+      vnc_preview?: string;
+      pass?: string;
+    }
+  };
+  markdownRef?: React.RefObject<HTMLDivElement>;
 }
 
 // Helper function to determine file type from extension
@@ -88,9 +98,40 @@ export function getLanguageFromExtension(fileName: string): string {
   return extensionToLanguage[extension] || '';
 }
 
-export function FileRenderer({ content, binaryUrl, fileName, className }: FileRendererProps) {
+export function FileRenderer({ 
+  content, 
+  binaryUrl, 
+  fileName, 
+  className, 
+  project,
+  markdownRef 
+}: FileRendererProps) {
   const fileType = getFileTypeFromExtension(fileName);
   const language = getLanguageFromExtension(fileName);
+  const isHtmlFile = fileName.toLowerCase().endsWith('.html');
+  
+  // Create blob URL for HTML content if needed
+  const blobHtmlUrl = React.useMemo(() => {
+    if (isHtmlFile && content && !project?.sandbox?.sandbox_url) {
+      const blob = new Blob([content], { type: 'text/html' });
+      return URL.createObjectURL(blob);
+    }
+    return undefined;
+  }, [isHtmlFile, content, project?.sandbox?.sandbox_url]);
+  
+  // Construct HTML file preview URL if we have a sandbox and the file is HTML
+  const htmlPreviewUrl = (isHtmlFile && project?.sandbox?.sandbox_url && fileName) 
+    ? constructHtmlPreviewUrl(project.sandbox.sandbox_url, fileName)
+    : blobHtmlUrl; // Use blob URL as fallback
+  
+  // Clean up blob URL on unmount
+  React.useEffect(() => {
+    return () => {
+      if (blobHtmlUrl) {
+        URL.revokeObjectURL(blobHtmlUrl);
+      }
+    };
+  }, [blobHtmlUrl]);
   
   return (
     <div className={cn("w-full h-full", className)}>
@@ -104,7 +145,13 @@ export function FileRenderer({ content, binaryUrl, fileName, className }: FileRe
       ) : fileType === 'pdf' && binaryUrl ? (
         <PdfRenderer url={binaryUrl} />
       ) : fileType === 'markdown' ? (
-        <MarkdownRenderer content={content || ''} />
+        <MarkdownRenderer content={content || ''} ref={markdownRef} />
+      ) : isHtmlFile ? (
+        <HtmlRenderer
+          content={content || ''}
+          previewUrl={htmlPreviewUrl || ''}
+          className="w-full h-full"
+        />
       ) : fileType === 'code' || fileType === 'text' ? (
         <CodeRenderer 
           content={content || ''} 

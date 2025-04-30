@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import GoogleSignIn from "@/components/GoogleSignIn";
 import { FlickeringGrid } from "@/components/home/ui/flickering-grid";
 import { useMediaQuery } from "@/hooks/use-media-query";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, Suspense } from "react";
 import { useScroll } from "motion/react";
 import { signIn, signUp, forgotPassword } from "./actions";
 import { useSearchParams, useRouter } from "next/navigation";
@@ -22,7 +22,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 
-export default function Login() {
+function LoginContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { user, isLoading } = useAuth();
@@ -101,8 +101,19 @@ export default function Login() {
   const handleSignIn = async (prevState: any, formData: FormData) => {
     if (returnUrl) {
       formData.append("returnUrl", returnUrl);
+    } else {
+      formData.append("returnUrl", "/dashboard");
     }
-    return signIn(prevState, formData);
+    const result = await signIn(prevState, formData);
+    
+    // Check for success and redirectTo properties
+    if (result && typeof result === 'object' && 'success' in result && result.success && 'redirectTo' in result) {
+      // Use window.location for hard navigation to avoid stale state
+      window.location.href = result.redirectTo as string;
+      return null; // Return null to prevent normal form action completion
+    }
+    
+    return result;
   };
 
   const handleSignUp = async (prevState: any, formData: FormData) => {
@@ -118,6 +129,13 @@ export default function Login() {
     formData.append("origin", window.location.origin);
     
     const result = await signUp(prevState, formData);
+    
+    // Check for success and redirectTo properties (direct login case)
+    if (result && typeof result === 'object' && 'success' in result && result.success && 'redirectTo' in result) {
+      // Use window.location for hard navigation to avoid stale state
+      window.location.href = result.redirectTo as string;
+      return null; // Return null to prevent normal form action completion
+    }
     
     // Check if registration was successful but needs email verification
     if (result && typeof result === 'object' && 'message' in result) {
@@ -166,9 +184,10 @@ export default function Login() {
 
   const resetRegistrationSuccess = () => {
     setRegistrationSuccess(false);
-    // Remove message from URL
+    // Remove message from URL and set mode to signin
     const params = new URLSearchParams(window.location.search);
     params.delete('message');
+    params.set('mode', 'signin');
     
     const newUrl = 
       window.location.pathname + 
@@ -523,5 +542,17 @@ export default function Login() {
         </DialogContent>
       </Dialog>
     </main>
+  );
+}
+
+export default function Login() {
+  return (
+    <Suspense fallback={
+      <main className="flex flex-col items-center justify-center min-h-screen w-full">
+        <div className="w-12 h-12 rounded-full border-4 border-primary border-t-transparent animate-spin"></div>
+      </main>
+    }>
+      <LoginContent />
+    </Suspense>
   );
 }

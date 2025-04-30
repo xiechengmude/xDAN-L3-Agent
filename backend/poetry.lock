@@ -465,17 +465,17 @@ urllib3 = ">=1.25.3,<3.0.0"
 
 [[package]]
 name = "daytona-sdk"
-version = "0.12.1"
+version = "0.14.0"
 description = "Python SDK for Daytona"
 optional = false
 python-versions = ">=3.7"
 files = [
-    {file = "daytona_sdk-0.12.1-py3-none-any.whl", hash = "sha256:2f7b884a3dbeb237f7d1aa7ec2ad6715eb1389e43ffc69e917ffadbd7eb09c30"},
-    {file = "daytona_sdk-0.12.1.tar.gz", hash = "sha256:133ca80ad192702d01934b44377b21fe11e8262748445a47cebbf3b9a2605307"},
+    {file = "daytona_sdk-0.14.0-py3-none-any.whl", hash = "sha256:a6e5c8d56b8d2342a1a630de93b7346ce2a6bc81cb21a928988964a7b3ce7b0d"},
+    {file = "daytona_sdk-0.14.0.tar.gz", hash = "sha256:1df3eaa664dc793a33690a2361cf5262713ca5ff1f1c5730eb00b4940f11b6e8"},
 ]
 
 [package.dependencies]
-daytona_api_client = ">=0.15.0,<1.0.0"
+daytona_api_client = ">=0.16.0,<1.0.0"
 Deprecated = ">=1.2.18,<2.0.0"
 environs = ">=9.5.0,<10.0.0"
 httpx = ">=0.28.0,<0.29.0"
@@ -2191,6 +2191,21 @@ docs = ["sphinx", "sphinx-rtd-theme", "zope.interface"]
 tests = ["coverage[toml] (==5.0.4)", "pytest (>=6.0.0,<7.0.0)"]
 
 [[package]]
+name = "pytesseract"
+version = "0.3.13"
+description = "Python-tesseract is a python wrapper for Google's Tesseract-OCR"
+optional = false
+python-versions = ">=3.8"
+files = [
+    {file = "pytesseract-0.3.13-py3-none-any.whl", hash = "sha256:7a99c6c2ac598360693d83a416e36e0b33a67638bb9d77fdcac094a3589d4b34"},
+    {file = "pytesseract-0.3.13.tar.gz", hash = "sha256:4bf5f880c99406f52a3cfc2633e42d9dc67615e69d8a509d74867d3baddb5db9"},
+]
+
+[package.dependencies]
+packaging = ">=21.3"
+Pillow = ">=8.0.0"
+
+[[package]]
 name = "pytest"
 version = "8.3.3"
 description = "pytest: simple powerful testing with Python"
@@ -2859,6 +2874,21 @@ release = ["twine"]
 test = ["pylint", "pytest", "pytest-black", "pytest-cov", "pytest-pylint"]
 
 [[package]]
+name = "stripe"
+version = "12.0.1"
+description = "Python bindings for the Stripe API"
+optional = false
+python-versions = ">=3.6"
+files = [
+    {file = "stripe-12.0.1-py2.py3-none-any.whl", hash = "sha256:b10b19dbd0622868b98a7c6e879ebde704be96ad75c780944bca4069bb427988"},
+    {file = "stripe-12.0.1.tar.gz", hash = "sha256:3fc7cc190946d8ebcc5b637e7e04f387d61b9c5156a89619a3ba90704ac09d4a"},
+]
+
+[package.dependencies]
+requests = {version = ">=2.20", markers = "python_version >= \"3.0\""}
+typing_extensions = {version = ">=4.5.0", markers = "python_version >= \"3.7\""}
+
+[[package]]
 name = "supabase"
 version = "2.15.0"
 description = "Supabase client for Python."
@@ -2891,6 +2921,22 @@ files = [
 [package.dependencies]
 httpx = {version = ">=0.26,<0.29", extras = ["http2"]}
 strenum = ">=0.4.15,<0.5.0"
+
+[[package]]
+name = "tavily-python"
+version = "0.5.4"
+description = "Python wrapper for the Tavily API"
+optional = false
+python-versions = ">=3.6"
+files = [
+    {file = "tavily_python-0.5.4-py3-none-any.whl", hash = "sha256:47f8c0b41283d44849fe9531596cd26d3de42a59618ef66f9e1244d8fedba404"},
+    {file = "tavily_python-0.5.4.tar.gz", hash = "sha256:fdad5303f9f6603a06fddcc7e21b128bebc1adf7694e553a664caf87eb2d2d9d"},
+]
+
+[package.dependencies]
+httpx = "*"
+requests = "*"
+tiktoken = ">=0.5.1"
 
 [[package]]
 name = "tenacity"
@@ -3591,4 +3637,4 @@ testing = ["coverage[toml]", "zope.event", "zope.testing"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11"
-content-hash = "065654a603730f66d780289c72b89303f3fa3f96cbaa990c003b052605b35a57"
+content-hash = "160a62f76af02d841f0f1b60e2d96c5c8e91310182d728dfa82bb792fa098e95"
